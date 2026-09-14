@@ -20,6 +20,7 @@ class StepStats:
         self.load_id = load_id
         self.params = params
         self.status = "success"
+        self.error: Exception | None = None
         self.note: str | None = None
         self.http_status: int | None = None
         self.attempts: int | None = None
@@ -84,6 +85,7 @@ class Journal:
             yield st
         except Exception as exc:
             st.status = "failed"
+            st.error = exc
             error = f"{type(exc).__name__}: {exc}"
             log.error("%s/%s %s: %s", source, entity, params, error)
             log.debug("traceback", exc_info=True)

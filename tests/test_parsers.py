@@ -2,7 +2,8 @@ from datetime import date
 from decimal import Decimal
 
 from pas.cbr import parse_currencies, parse_dynamic
-from pas.fedstat import build_download_form, parse_indicator_page, parse_sdmx, parse_week
+from pas.fedstat import (IndicatorMeta, build_download_form, parse_indicator_page, parse_sdmx, parse_week,
+                         plan_chunks)
 
 CBR_DYNAMIC = (
     '<?xml version="1.0" encoding="windows-1251"?>'
@@ -80,6 +81,25 @@ def test_parse_sdmx():
     rows, codes = parse_sdmx(SDMX, CONCEPTS)
     assert rows == [("45000000000", "2501", 2025, "3 неделя 2025", 3, Decimal("61.5"), "61,5", "рубль")]
     assert codes == [("s_grtov", "2501", "Картофель, кг")]
+
+
+class FakeConn:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def execute(self, *args, **kwargs):
+        return self.rows
+
+
+def test_plan_chunks_refreshes_latest_year_and_backfills_gaps():
+    meta = IndicatorMeta(filters={58273: {"title": "p", "values": {1: "A", 2: "B"}},
+                                  3: {"title": "y", "values": {2024: "2024", 2025: "2025", 2026: "2026"}}},
+                         left=[], top=[], token="t")
+    c = {"dimensions": {"product": 58273, "year": 3}, "start_year": 2024,
+         "products_per_request": 1, "refresh_previous_year_days": 0}
+    done = FakeConn([(2024, "A"), (2024, "B"), (2025, "A"), (2026, "A"), (2026, "B")])
+    chunks = plan_chunks(done, meta, c, {58273: [1, 2]}, full=False, from_year=None)
+    assert chunks == [(2026, [1], "refresh"), (2026, [2], "refresh"), (2025, [2], "backfill")]
 
 
 def test_parse_week():

@@ -42,6 +42,7 @@ def main(argv: list[str] | None = None) -> int:
     load.add_argument("--force", action="store_true", help="ЦБ: игнорировать ограничение 1 запрос в сутки")
     load.add_argument("--full", action="store_true", help="fedstat: перезагрузить все годы с start_year")
     load.add_argument("--from-year", type=int, help="fedstat: перезагрузить годы начиная с указанного")
+    load.add_argument("--max-requests", type=int, help="fedstat: не более N запросов выгрузки за запуск")
     sub.add_parser("status", help="журнал загрузок и свежесть данных")
     args = parser.parse_args(argv)
 
@@ -64,7 +65,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.source in ("all", "cbr"):
             cbr.run(conn, journal, session, cfg, force=args.force)
         if args.source in ("all", "fedstat"):
-            fedstat.run(conn, journal, session, cfg, full=args.full, from_year=args.from_year)
+            fedstat.run(conn, journal, session, cfg, full=args.full, from_year=args.from_year,
+                        max_requests=args.max_requests)
         status = journal.finish()
         print(f"Запуск {journal.run_id} завершён со статусом {status}: {dict(journal.counts)}")
         return 0 if status == "success" else 1

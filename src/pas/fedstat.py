@@ -1,6 +1,7 @@
 import re
 import time
 from dataclasses import dataclass
+from datetime import date
 
 import psycopg
 import requests
@@ -14,6 +15,7 @@ from .storage import save_payload, upsert_rows
 NS = {"g": "http://www.SDMX.org/resources/SDMXML/schemas/v1_0/generic"}
 OBS_KEY = ["okato_code", "product_code", "obs_year", "period_label"]
 OBS_VALS = ["week_no", "value", "value_raw", "unit"]
+BLOCKING_STATUSES = (403, 429)
 
 _ITEM_RE = re.compile(r"(\d+):\s*\{\s*title:\s*'((?:[^'\\]|\\.)*)',\s*(\w+):")
 _TOKEN_RE = re.compile(r'id="downloadTokenHolder">.*?name="token" value="([^"]+)"', re.S)
@@ -125,11 +127,37 @@ def resolve_selection(meta: IndicatorMeta, c: dict) -> dict[int, list[int]]:
     return {dims["product"]: [by_title[p] for p in c["products"]], dims["region"]: regions}
 
 
+def plan_chunks(conn: psycopg.Connection, meta: IndicatorMeta, c: dict, selection: dict[int, list[int]],
+                full: bool, from_year: int | None) -> list[tuple[int, list[int], str]]:
+    dims = c["dimensions"]
+    names = meta.filters[dims["product"]]["values"]
+    products = selection[dims["product"]]
+    years = sorted(y for y in meta.filters[dims["year"]]["values"] if y >= (from_year or c["start_year"]))
+    refresh = {years[-1]}
+    if date.today().timetuple().tm_yday <= c["refresh_previous_year_days"]:
+        refresh.add(years[-1] - 1)
+    done = set() if full or from_year else {tuple(r) for r in conn.execute(
+        """select (l.params ->> 'year')::int, p.name
+           from meta.load_log l cross join jsonb_array_elements_text(l.params -> 'products') as p(name)
+           where l.source = 'fedstat' and l.entity = 'observations' and l.status = 'success'""")}
+    size = c.get("products_per_request") or len(products)
+    chunks = []
+    for year in sorted(years, key=lambda y: (y not in refresh, y)):
+        mode = "full" if full or from_year else ("refresh" if year in refresh else "backfill")
+        todo = [p for p in products if mode != "backfill" or (year, names[p]) not in done]
+        chunks += [(year, todo[i:i + size], mode) for i in range(0, len(todo), size)]
+    return chunks
+
+
+def _blocked(error: Exception | None) -> bool:
+    return (isinstance(error, requests.HTTPError) and error.response is not None
+            and error.response.status_code in BLOCKING_STATUSES)
+
+
 def run(conn: psycopg.Connection, journal: Journal, session: requests.Session, cfg: dict,
-        full: bool = False, from_year: int | None = None) -> None:
+        full: bool = False, from_year: int | None = None, max_requests: int | None = None) -> None:
     c = cfg["sources"]["fedstat"]
-    timeout, pause = cfg["http"]["timeout_sec"], cfg["http"]["pause_sec"]
-    retries, backoff = cfg["http"]["retries"], cfg["http"]["backoff_sec"]
+    timeout, retries, backoff = cfg["http"]["timeout_sec"], cfg["http"]["retries"], cfg["http"]["backoff_sec"]
     dims = c["dimensions"]
     page_url = f"{c['base_url']}/indicator/{c['indicator_id']}"
     download_url = f"{c['base_url']}/indicator/downloadData.do?format=sdmx"
@@ -148,44 +176,48 @@ def run(conn: psycopg.Connection, journal: Journal, session: requests.Session, c
     if st.status == "failed":
         return
 
-    last_year = conn.execute("select max(obs_year) from raw.fedstat_obs").fetchone()[0]
-    first_year = from_year or (c["start_year"] if full or last_year is None else last_year)
-    years = [y for y in sorted(meta.filters[dims["year"]]["values"]) if y >= first_year]
+    chunks = plan_chunks(conn, meta, c, selection, full, from_year)
+    limit = max_requests or c["max_requests_per_run"]
+    deferred, reason = chunks[limit:], f"лимит {limit} запросов за запуск (sources.fedstat.max_requests_per_run)"
     product_names = meta.filters[dims["product"]]["values"]
-    products = selection[dims["product"]]
-    chunk = c.get("products_per_request") or len(products)
     token = meta.token
 
-    for year in years:
-        for i in range(0, len(products), chunk):
-            part = products[i:i + chunk]
-            params = {"year": year, "products": [product_names[p] for p in part],
-                      "regions": len(selection[dims["region"]]),
-                      "mode": "full" if full or from_year else ("incremental" if last_year else "initial")}
-            with journal.step("fedstat", "observations", params) as st:
-                def download() -> requests.Response:
-                    nonlocal token
-                    form_selection = {**selection, dims["product"]: part, dims["year"]: [year]}
-                    for _ in range(2):
-                        if not token:
-                            token = parse_token(fetch(session, "GET", page_url, timeout=timeout).text)
-                        form = build_download_form(meta, c["indicator_id"], token, form_selection)
-                        response = fetch(session, "POST", download_url, data=form, timeout=timeout)
-                        if "xml" in response.headers.get("Content-Type", ""):
-                            return response
-                        token = None
-                    return response
+    for n, (year, part, mode) in enumerate(chunks[:limit]):
+        params = {"year": year, "products": [product_names[p] for p in part],
+                  "regions": len(selection[dims["region"]]), "mode": mode}
+        with journal.step("fedstat", "observations", params) as st:
+            def download() -> requests.Response:
+                nonlocal token
+                form_selection = {**selection, dims["product"]: part, dims["year"]: [year]}
+                for _ in range(2):
+                    if not token:
+                        token = parse_token(fetch(session, "GET", page_url, timeout=timeout).text)
+                    form = build_download_form(meta, c["indicator_id"], token, form_selection)
+                    response = fetch(session, "POST", download_url, data=form, timeout=timeout)
+                    if "xml" in response.headers.get("Content-Type", ""):
+                        return response
+                    token = None
+                return response
 
-                time.sleep(pause)
-                response, attempts = with_retries(download, retries, backoff, f"fedstat {year}")
-                st.record_response(response)
-                st.attempts += attempts - 1
-                st.payload_id = save_payload(conn, st.load_id, "fedstat", "observations", download_url, params, response)
-                content_type = response.headers.get("Content-Type", "")
-                if "xml" not in content_type:
-                    raise SourceSchemaError(f"вместо SDMX получен {content_type}: форма выгрузки отклонена")
-                rows, codes = parse_sdmx(response.content, c["sdmx_concepts"])
-                st.apply(upsert_rows(conn, "raw.fedstat_obs", OBS_KEY, OBS_VALS, rows, st.payload_id))
-                upsert_rows(conn, "raw.fedstat_code", ["dim", "code"], ["name"], codes, st.payload_id)
-                if not rows:
-                    st.note = "источник не вернул наблюдений"
+            time.sleep(c["pause_sec"])
+            response, attempts = with_retries(download, retries, backoff, f"fedstat {year}")
+            st.record_response(response)
+            st.attempts += attempts - 1
+            st.payload_id = save_payload(conn, st.load_id, "fedstat", "observations", download_url, params, response)
+            content_type = response.headers.get("Content-Type", "")
+            if "xml" not in content_type:
+                raise SourceSchemaError(f"вместо SDMX получен {content_type}: форма выгрузки отклонена")
+            rows, codes = parse_sdmx(response.content, c["sdmx_concepts"])
+            st.apply(upsert_rows(conn, "raw.fedstat_obs", OBS_KEY, OBS_VALS, rows, st.payload_id))
+            upsert_rows(conn, "raw.fedstat_code", ["dim", "code"], ["name"], codes, st.payload_id)
+            if not rows:
+                st.note = "источник не вернул наблюдений"
+        if _blocked(st.error):
+            deferred = chunks[n + 1:] + deferred
+            reason = f"источник ограничил доступ (HTTP {st.error.response.status_code}), запросы прекращены"
+            break
+
+    if deferred:
+        with journal.step("fedstat", "observations", {"deferred_requests": len(deferred),
+                                                      "years": sorted({y for y, _, _ in deferred})}) as st:
+            st.skip(f"{reason}; отложено до следующего запуска")
