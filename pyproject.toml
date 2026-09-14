@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pas-food-prices"
+version = "0.1.0"
+description = "Прогнозно-аналитическая система цен на плодоовощную продукцию"
+requires-python = ">=3.11"
+dependencies = [
+    "requests>=2.31",
+    "lxml>=5.0",
+    "psycopg[binary]>=3.1",
+    "PyYAML>=6.0",
+    "python-dotenv>=1.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+pas = "pas.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

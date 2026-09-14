@@ -1,0 +1,38 @@
+http:
+  timeout_sec: 180
+  retries: 4
+  backoff_sec: 3
+  pause_sec: 2
+  user_agent: "Mozilla/5.0 (compatible; pas-food-price-forecast/0.1; educational project)"
+
+sources:
+  cbr:
+    base_url: https://www.cbr.ru/scripts
+    currencies: [R01235, R01239, R01375]  # USD, EUR, CNY
+    start_date: 2008-01-01
+    overlap_days: 7
+    min_interval_hours: 24
+
+  fedstat:
+    base_url: https://www.fedstat.ru
+    indicator_id: 37426
+    start_year: 2008
+    products_per_request: 1  # 5 товаров x 103 территории за год ~12 МБ — сервер обрывает такой ответ
+    dimensions:
+      product: 58273
+      region: 57831
+      year: 3
+      period: 33560
+    sdmx_concepts:
+      region: s_OKATO
+      product: s_grtov
+      period: PERIOD
+      unit: EI
+    products:
+      - Картофель, кг
+      - Капуста белокочанная свежая, кг
+      - Лук репчатый, кг
+      - Морковь, кг
+      - Яблоки, кг
+    regions:
+      include_regex: '(российская федерация|федеральный округ|област|край|республик|автономн|федерального значения)'
